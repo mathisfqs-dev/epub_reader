@@ -1,0 +1,7 @@
+tags:
+  model:
+    # Needs the Kokoro model installed by the app (skipped otherwise).
+    timeout: 2x
+  network:
+    # Downloads from the internet (tool/dictionary_install_test.dart).
+    timeout: 4x
