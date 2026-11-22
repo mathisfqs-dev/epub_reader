@@ -35,6 +35,14 @@ const pocketLanguageNames = {
   'nl': 'Nederlands',
 };
 
+/// Archive names of the Pocket TTS language packs published on Hugging Face.
+const pocketRemoteArchives = {
+  'en': 'pocket-english-int8.tar.bz2',
+  'fr': 'pocket-french-int8.tar.bz2',
+  'de': 'pocket-german-int8.tar.bz2',
+  'es': 'pocket-spanish-int8.tar.bz2',
+};
+
 /// Voices of Kyutai's catalog (kyutai/tts-voices) whose gender we know.
 const _knownFemale = {
   'alba': true,
@@ -166,27 +174,48 @@ class PocketVoice implements Voice {
 }
 
 /// Pocket TTS (Kyutai) packs installed in `<models>/pocket/<language>`,
-/// one per language. They aren't downloadable: they are made with
-/// `pocket_tts_export` and installed from a folder on disk.
+/// one per language. Each language can be downloaded on demand from Hugging
+/// Face ([downloadLanguage]) or installed from a local folder made with
+/// `pocket_tts_export` ([installFrom]).
 class PocketModel extends ChangeNotifier implements VoiceModel {
-  PocketModel(Directory modelsDirectory)
-    : directory = Directory(p.join(modelsDirectory.path, 'pocket')) {
+  PocketModel(
+    Directory modelsDirectory, {
+    this.baseUrl = defaultBaseUrl,
+  }) : directory = Directory(p.join(modelsDirectory.path, 'pocket')) {
     _scan();
   }
 
+  static const repoId = 'Duf-1/pocket-tts-sherpa-onnx';
+  static const defaultBaseUrl =
+      'https://huggingface.co/$repoId/resolve/main';
   static const approximateSizePerLanguage = '185 MB';
 
+  /// Languages available for one-click download from [baseUrl].
+  static List<String> get downloadableLanguages =>
+      pocketRemoteArchives.keys.toList();
+
   final Directory directory;
+  final String baseUrl;
 
   var _packs = <PocketPack>[];
   var _status = ModelStatus.missing;
+  String? _downloadingLanguage;
+  double? _progress;
   String? _error;
+  HttpClient? _client;
   Future<PocketEngine>? _engine;
 
   List<PocketPack> get packs => _packs;
   ModelStatus get status => _status;
+
+  /// Language code (`fr`, `en`…) currently being downloaded or extracted.
+  String? get downloadingLanguage => _downloadingLanguage;
+
+  /// Download progress in [0, 1], null if unknown.
+  double? get progress => _progress;
   String? get error => _error;
-  bool get isBusy => _status == ModelStatus.extracting;
+  bool get isBusy =>
+      _status == ModelStatus.downloading || _status == ModelStatus.extracting;
 
   @override
   TtsModelKind get kind => TtsModelKind.pocket;
@@ -272,10 +301,7 @@ class PocketModel extends ChangeNotifier implements VoiceModel {
         if (Directory(part).existsSync()) {
           await Directory(part).delete(recursive: true);
         }
-        final result = await Process.run('cp', ['-R', pack.directory, part]);
-        if (result.exitCode != 0) {
-          throw ProcessException('cp', [], '${result.stderr}');
-        }
+        await _copyDirectory(Directory(pack.directory), Directory(part));
         if (Directory(target).existsSync()) {
           await Directory(target).delete(recursive: true);
         }
@@ -292,6 +318,108 @@ class PocketModel extends ChangeNotifier implements VoiceModel {
       _set(isReady ? ModelStatus.ready : ModelStatus.failed, error: '$e');
       return const [];
     }
+  }
+
+  static Future<void> _copyDirectory(Directory source, Directory target) async {
+    await target.create(recursive: true);
+    await for (final entity in source.list(recursive: true)) {
+      final relative = p.relative(entity.path, from: source.path);
+      final dstPath = p.join(target.path, relative);
+      if (entity is Directory) {
+        await Directory(dstPath).create(recursive: true);
+      } else if (entity is File) {
+        await File(dstPath).parent.create(recursive: true);
+        await entity.copy(dstPath);
+      }
+    }
+  }
+
+  /// Downloads and installs the Pocket TTS pack for [language] (`en`, `fr`,
+  /// `de`, `es`) from Hugging Face.
+  Future<bool> downloadLanguage(String language) async {
+    final archiveName = pocketRemoteArchives[language];
+    if (archiveName == null) {
+      _set(
+        isReady ? ModelStatus.ready : ModelStatus.failed,
+        error: 'No Pocket TTS download for "$language"',
+      );
+      return false;
+    }
+    if (isBusy) return false;
+    _downloadingLanguage = language;
+    _set(ModelStatus.downloading, progress: 0);
+    final archive = File(p.join(directory.path, '$archiveName.part'));
+    final staging = Directory(p.join(directory.path, '.extract_$language'));
+    IOSink? sink;
+    try {
+      await directory.create(recursive: true);
+      if (archive.existsSync()) archive.deleteSync();
+      if (staging.existsSync()) await staging.delete(recursive: true);
+      final url = '$baseUrl/$archiveName';
+      _client = HttpClient();
+      final request = await _client!.getUrl(Uri.parse(url));
+      final response = await request.close();
+      if (response.statusCode != 200) {
+        throw HttpException('HTTP ${response.statusCode}', uri: Uri.parse(url));
+      }
+      final total = response.contentLength;
+      var received = 0;
+      sink = archive.openWrite();
+      await for (final chunk in response) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (total > 0) {
+          final next = received / total;
+          if (next - (_progress ?? 0) > 0.005) {
+            _set(ModelStatus.downloading, progress: next);
+          }
+        }
+      }
+      await sink.close();
+      sink = null;
+
+      _set(ModelStatus.extracting);
+      await staging.create(recursive: true);
+      final result = await Process.run('tar', [
+        '-xjf',
+        archive.path,
+        '-C',
+        staging.path,
+      ]);
+      if (result.exitCode != 0) {
+        throw ProcessException('tar', [], '${result.stderr}');
+      }
+      _downloadingLanguage = null;
+      _progress = null;
+      _status = isReady ? ModelStatus.ready : ModelStatus.missing;
+      final installed = await installFrom(staging.path);
+      if (installed.isEmpty) {
+        throw StateError('The archive does not contain a valid Pocket TTS pack');
+      }
+      return true;
+    } catch (e) {
+      _downloadingLanguage = null;
+      _progress = null;
+      if (_status != ModelStatus.missing) {
+        _scan();
+        _set(isReady ? ModelStatus.ready : ModelStatus.failed, error: '$e');
+      }
+      return false;
+    } finally {
+      await sink?.close().catchError((_) {});
+      _client?.close(force: true);
+      _client = null;
+      if (archive.existsSync()) archive.deleteSync();
+      if (staging.existsSync()) await staging.delete(recursive: true);
+    }
+  }
+
+  void cancelDownload() {
+    if (_status != ModelStatus.downloading) return;
+    _downloadingLanguage = null;
+    _scan();
+    _set(isReady ? ModelStatus.ready : ModelStatus.missing);
+    _client?.close(force: true);
   }
 
   @override
@@ -312,14 +440,16 @@ class PocketModel extends ChangeNotifier implements VoiceModel {
     await engine?.then((e) => e.dispose(), onError: (_) {});
   }
 
-  void _set(ModelStatus status, {String? error}) {
+  void _set(ModelStatus status, {double? progress, String? error}) {
     _status = status;
+    _progress = progress;
     _error = error;
     notifyListeners();
   }
 
   @override
   void dispose() {
+    _client?.close(force: true);
     unload();
     super.dispose();
   }

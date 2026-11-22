@@ -208,4 +208,46 @@ void main() {
     final silent = AudioClip(Float32List(50), 1000);
     expect(silent.trimSilence(), same(silent));
   });
+
+  test('downloads and installs a language pack from Hugging Face URL', () async {
+    final srcDir = Directory(p.join(tmp.path, 'src'));
+    fakePack(srcDir, 'pocket-french-int8', 'french', ['estelle', 'fabien']);
+    final tarFile = File(p.join(tmp.path, 'pocket-french-int8.tar.bz2'));
+    final tarRes = await Process.run('tar', [
+      '-cjf',
+      tarFile.path,
+      '-C',
+      srcDir.path,
+      'pocket-french-int8',
+    ]);
+    expect(tarRes.exitCode, 0);
+
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((req) async {
+      if (req.uri.path == '/pocket-french-int8.tar.bz2') {
+        final bytes = tarFile.readAsBytesSync();
+        req.response.contentLength = bytes.length;
+        req.response.add(bytes);
+      } else {
+        req.response.statusCode = 404;
+      }
+      await req.response.close();
+    });
+
+    final model = PocketModel(
+      Directory(p.join(tmp.path, 'models')),
+      baseUrl: 'http://127.0.0.1:${server.port}',
+    );
+    expect(model.isReady, isFalse);
+
+    final ok = await model.downloadLanguage('fr');
+    expect(ok, isTrue);
+    expect(model.isReady, isTrue);
+    expect(model.supportsLanguage('fr'), isTrue);
+    expect(model.voicesFor('fr').map((v) => v.key), [
+      'pocket:fr:estelle',
+      'pocket:fr:fabien',
+    ]);
+  });
 }

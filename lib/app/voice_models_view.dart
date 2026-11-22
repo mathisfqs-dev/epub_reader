@@ -95,8 +95,8 @@ class _KokoroPanel extends StatelessWidget {
               ModelStatus.extracting => 'Installing…',
               _ =>
                 'Reading aloud uses Kokoro, an open-source voice model '
-                    'that runs on this Mac. It needs a one-time download '
-                    'of about ${KokoroModel.approximateSize}.',
+                    'that runs locally on your computer. It needs a one-time '
+                    'download of about ${KokoroModel.approximateSize}.',
             }),
             if (model.isBusy) ...[
               const SizedBox(height: 16),
@@ -173,23 +173,67 @@ class _PocketPanel extends StatelessWidget {
     return ListenableBuilder(
       listenable: model,
       builder: (context, _) {
-        final packs = model.packs;
+        final packs = {for (final p in model.packs) p.language: p};
+        final status = model.status;
+        final downloadingLang = model.downloadingLanguage;
         return Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (packs.isEmpty)
-              Text(
-                'Pocket TTS (Kyutai) runs on this Mac too. Its models are '
-                'made with pocket_tts_export and installed from a folder: '
-                'pick one model (pocket-french-int8…) or the folder that '
-                'holds them (pocket_tts_export/out). About '
-                '${PocketModel.approximateSizePerLanguage} per language.',
-              )
-            else
-              for (final pack in packs)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Text(
+                  'Pocket TTS (Kyutai) runs locally on your computer. Download '
+                  'the languages you read (about '
+                  '${PocketModel.approximateSizePerLanguage} each):',
+                ),
+              ),
+            for (final lang in PocketModel.downloadableLanguages)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  children: [
+                    if (packs.containsKey(lang))
+                      Icon(Icons.check, size: 18, color: reader.accent)
+                    else
+                      Icon(
+                        Icons.language,
+                        size: 18,
+                        color: reader.secondaryText,
+                      ),
+                    const SizedBox(width: 8),
+                    Text(
+                      pocketLanguageNames[lang] ?? lang,
+                      style: theme.textTheme.bodyLarge,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        packs[lang]
+                                ?.voices
+                                .map((v) => v.description.split(' · ').first)
+                                .join(', ') ??
+                            '~${PocketModel.approximateSizePerLanguage}',
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodyMedium?.copyWith(
+                          color: reader.secondaryText,
+                        ),
+                      ),
+                    ),
+                    if (!packs.containsKey(lang) && !model.isBusy)
+                      TextButton.icon(
+                        onPressed: () => model.downloadLanguage(lang),
+                        icon: const Icon(Icons.download, size: 16),
+                        label: const Text('Download'),
+                      ),
+                  ],
+                ),
+              ),
+            for (final pack in model.packs)
+              if (!PocketModel.downloadableLanguages.contains(pack.language))
                 Padding(
-                  padding: const EdgeInsets.only(bottom: 4),
+                  padding: const EdgeInsets.only(bottom: 6),
                   child: Row(
                     children: [
                       Icon(Icons.check, size: 18, color: reader.accent),
@@ -211,10 +255,30 @@ class _PocketPanel extends StatelessWidget {
                   ),
                 ),
             if (model.isBusy) ...[
-              const SizedBox(height: 16),
-              const LinearProgressIndicator(),
+              const SizedBox(height: 12),
+              LinearProgressIndicator(
+                value: status == ModelStatus.downloading
+                    ? model.progress
+                    : null,
+              ),
               const SizedBox(height: 6),
-              Text('Installing…', style: theme.textTheme.bodySmall),
+              Row(
+                children: [
+                  Text(
+                    status == ModelStatus.downloading
+                        ? 'Downloading ${pocketLanguageNames[downloadingLang] ?? ''}…'
+                              '${model.progress != null ? ' ${(model.progress! * 100).round()} %' : ''}'
+                        : 'Installing…',
+                    style: theme.textTheme.bodySmall,
+                  ),
+                  const Spacer(),
+                  if (status == ModelStatus.downloading)
+                    TextButton(
+                      onPressed: model.cancelDownload,
+                      child: const Text('Cancel'),
+                    ),
+                ],
+              ),
             ],
             if (model.error != null && !model.isBusy) ...[
               const SizedBox(height: 12),
@@ -224,15 +288,11 @@ class _PocketPanel extends StatelessWidget {
               ),
             ],
             if (!model.isBusy) ...[
-              const SizedBox(height: 16),
+              const SizedBox(height: 12),
               OutlinedButton.icon(
                 onPressed: () => _install(context),
                 icon: const Icon(Icons.folder_open_outlined),
-                label: Text(
-                  packs.isEmpty
-                      ? 'Install from a folder…'
-                      : 'Add or update languages…',
-                ),
+                label: const Text('Install from a folder…'),
               ),
             ],
           ],

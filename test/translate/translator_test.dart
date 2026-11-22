@@ -1,8 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' show Abi;
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:epub_reader/translate/languages.dart';
+import 'package:epub_reader/translate/llama_server.dart';
+import 'package:epub_reader/translate/translation_model.dart';
 import 'package:epub_reader/translate/translator.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -204,5 +208,150 @@ void main() {
       await closed.future.timeout(const Duration(seconds: 2));
       expect(pieces.first, 'one');
     });
+  });
+
+  group('LlamaTranslationModel download', () {
+    late HttpServer server;
+    late Directory temp;
+    late Directory modelsDir;
+    var serverDownloads = 0;
+    var modelDownloads = 0;
+
+    setUp(() async {
+      temp = Directory.systemTemp.createTempSync('llama_model_test');
+      modelsDir = Directory('${temp.path}/models');
+      serverDownloads = 0;
+      modelDownloads = 0;
+
+      // Create a tar.gz archive containing a nested llama-b11429/llama-server
+      // and a fake dylib.
+      final archiveSrc = Directory('${temp.path}/archive_src/llama-b11429')
+        ..createSync(recursive: true);
+      File('${archiveSrc.path}/llama-server').writeAsStringSync('#!/bin/sh\n');
+      File('${archiveSrc.path}/libllama.dylib').writeAsStringSync('dylib');
+      final tarFile = File('${temp.path}/llama.tar.gz');
+      final tarRes = await Process.run('tar', [
+        '-czf',
+        tarFile.path,
+        '-C',
+        '${temp.path}/archive_src',
+        'llama-b11429',
+      ]);
+      expect(tarRes.exitCode, 0);
+
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      server.listen((req) async {
+        if (req.uri.path == '/llama.tar.gz') {
+          serverDownloads++;
+          final bytes = tarFile.readAsBytesSync();
+          req.response.contentLength = bytes.length;
+          req.response.add(bytes);
+          await req.response.close();
+        } else if (req.uri.path == '/model.gguf') {
+          modelDownloads++;
+          final bytes = utf8.encode('fake-gguf-weights');
+          req.response.contentLength = bytes.length;
+          req.response.add(bytes);
+          await req.response.close();
+        } else {
+          req.response.statusCode = 404;
+          await req.response.close();
+        }
+      });
+    });
+
+    tearDown(() async {
+      await server.close(force: true);
+      if (temp.existsSync()) temp.deleteSync(recursive: true);
+    });
+
+    test(
+      'skips downloading llama-server when one is already installed',
+      () async {
+        final existing = File('${temp.path}/existing-llama-server')
+          ..writeAsStringSync('#!/bin/sh\n');
+        final model = LlamaTranslationModel(
+          modelsDir,
+          modelUrl: 'http://127.0.0.1:${server.port}/model.gguf',
+          serverArchiveUrl: 'http://127.0.0.1:${server.port}/llama.tar.gz',
+          findServer: () => existing.path,
+        );
+        expect(model.isReady, isFalse);
+
+        await model.download();
+
+        expect(model.isReady, isTrue);
+        expect(serverDownloads, 0);
+        expect(modelDownloads, 1);
+        expect(
+          File(
+            '${modelsDir.path}/llm/${LlamaTranslationModel.fileName}',
+          ).existsSync(),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'downloads and extracts llama-server into bin/ when missing',
+      () async {
+        final binServer = File('${temp.path}/bin/llama-server');
+        final model = LlamaTranslationModel(
+          modelsDir,
+          modelUrl: 'http://127.0.0.1:${server.port}/model.gguf',
+          serverArchiveUrl: 'http://127.0.0.1:${server.port}/llama.tar.gz',
+          findServer: () => binServer.existsSync() ? binServer.path : null,
+        );
+        expect(model.isReady, isFalse);
+
+        await model.download();
+
+        expect(model.isReady, isTrue);
+        expect(serverDownloads, 1);
+        expect(modelDownloads, 1);
+        expect(binServer.existsSync(), isTrue);
+        expect(File('${temp.path}/bin/libllama.dylib').existsSync(), isTrue);
+      },
+    );
+
+    test(
+      'selects the right llama-server release archive per OS/ABI and extracts .zip archives',
+      () async {
+        expect(
+          LlamaServer.releaseArchiveName(abi: Abi.macosArm64),
+          'llama-b11429-bin-macos-arm64.tar.gz',
+        );
+        expect(
+          LlamaServer.releaseArchiveName(abi: Abi.macosX64),
+          'llama-b11429-bin-macos-x64.tar.gz',
+        );
+        expect(
+          LlamaServer.releaseArchiveName(abi: Abi.linuxX64),
+          'llama-b11429-bin-ubuntu-x64.tar.gz',
+        );
+        expect(
+          LlamaServer.releaseArchiveName(abi: Abi.windowsX64),
+          'llama-b11429-bin-win-cpu-x64.zip',
+        );
+
+        final zipArchive = Archive()
+          ..addFile(
+            ArchiveFile(
+              'llama-b11429/${LlamaServer.binaryName}',
+              4,
+              utf8.encode('test'),
+            ),
+          )
+          ..addFile(
+            ArchiveFile('llama-b11429/llama.dll', 3, utf8.encode('dll')),
+          );
+        final zipFile = File('${temp.path}/llama.zip')
+          ..writeAsBytesSync(ZipEncoder().encode(zipArchive));
+        final outBin = Directory('${temp.path}/zip_bin');
+        final extracted = await LlamaServer.extractArchive(zipFile, outBin);
+        expect(File(extracted).existsSync(), isTrue);
+        expect(File('${outBin.path}/llama.dll').existsSync(), isTrue);
+      },
+    );
   });
 }

@@ -269,7 +269,7 @@ class _InstallModel extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Translation runs on this Mac with ${model.displayName}. '
+          'Translation runs locally on your computer with ${model.displayName}. '
           'The model (${model.approximateSize}) is downloaded once.',
           style: secondary,
         ),

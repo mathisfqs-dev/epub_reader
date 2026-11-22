@@ -39,15 +39,18 @@ abstract class TranslationModel extends ChangeNotifier {
 /// Gemma 3 4B (GGUF, Q4_K_M) run by a llama-server process.
 ///
 /// The server starts on the first translation and stops after [idleTimeout]
-/// without one, or when the app quits.
+/// without one, or when the app quits. If no `llama-server` is installed on
+/// the machine (Homebrew, bundle, or `$LLAMA_SERVER`), [download] also fetches
+/// the official prebuilt `llama-server` binary into `<appSupport>/bin/`.
 class LlamaTranslationModel extends TranslationModel {
   LlamaTranslationModel(
     this.modelsDirectory, {
     this.idleTimeout = const Duration(minutes: 10),
-  }) {
-    _status = _modelFile.existsSync()
-        ? LlmFileStatus.ready
-        : LlmFileStatus.missing;
+    this.modelUrl = url,
+    String? serverArchiveUrl,
+    this.findServer,
+  }) : serverArchiveUrl = serverArchiveUrl ?? LlamaServer.releaseUrl {
+    _status = _complete() ? LlmFileStatus.ready : LlmFileStatus.missing;
     // A server left running by a crash of the app holds ~3 GB.
     LlamaServer.stopStale(_pidFile).catchError((_) {});
   }
@@ -58,6 +61,9 @@ class LlamaTranslationModel extends TranslationModel {
 
   final Directory modelsDirectory;
   final Duration idleTimeout;
+  final String modelUrl;
+  final String serverArchiveUrl;
+  final String? Function()? findServer;
 
   late LlmFileStatus _status;
   double? _progress;
@@ -68,11 +74,20 @@ class LlamaTranslationModel extends TranslationModel {
   Timer? _idle;
 
   Directory get _directory => Directory(p.join(modelsDirectory.path, 'llm'));
+  Directory get binDirectory =>
+      Directory(p.join(modelsDirectory.parent.path, 'bin'));
   File get _modelFile => File(p.join(_directory.path, fileName));
   File get _pidFile => File(p.join(_directory.path, 'llama-server.pid'));
 
   /// llama-server's output, kept for debugging.
   File get logFile => File(p.join(_directory.path, 'llama-server.log'));
+
+  String? _locateServer() =>
+      findServer != null
+          ? findServer!()
+          : LlamaServer.find(extraDirectory: binDirectory.path);
+
+  bool _complete() => _modelFile.existsSync() && _locateServer() != null;
 
   @override
   LlmFileStatus get status => _status;
@@ -114,12 +129,11 @@ class LlamaTranslationModel extends TranslationModel {
   }
 
   Future<LlamaServer> _start() async {
-    final binary = LlamaServer.find(
-      extraDirectory: p.join(modelsDirectory.parent.path, 'bin'),
-    );
+    var binary = _locateServer();
     if (binary == null) {
+      _set(LlmFileStatus.missing);
       throw TranslationException(
-        'llama-server was not found. Install it with "brew install llama.cpp".',
+        'llama-server is not installed. Download it from the translation panel.',
       );
     }
     _setStarting(true);
@@ -162,21 +176,83 @@ class LlamaTranslationModel extends TranslationModel {
   Future<void> download() async {
     if (_status == LlmFileStatus.downloading || isReady) return;
     _set(LlmFileStatus.downloading, progress: 0);
+    try {
+      await _directory.create(recursive: true);
+      _client = HttpClient();
+      if (_locateServer() == null) {
+        await _downloadServer();
+      }
+      if (!_modelFile.existsSync()) {
+        await _downloadModelFile();
+      }
+      if (!_complete()) {
+        throw StateError('Download incomplete');
+      }
+      _set(LlmFileStatus.ready);
+    } catch (e) {
+      if (_status != LlmFileStatus.missing) {
+        _set(LlmFileStatus.failed, error: '$e');
+      }
+    } finally {
+      _client?.close(force: true);
+      _client = null;
+    }
+  }
+
+  Future<void> _downloadServer() async {
+    final ext = serverArchiveUrl.endsWith('.zip') ? '.zip' : '.tar.gz';
+    final archive = File(p.join(_directory.path, 'llama-server$ext.part'));
+    IOSink? sink;
+    try {
+      if (archive.existsSync()) archive.deleteSync();
+      final request = await _client!.getUrl(Uri.parse(serverArchiveUrl));
+      final response = await request.close();
+      if (response.statusCode != 200) {
+        throw HttpException(
+          'HTTP ${response.statusCode}',
+          uri: Uri.parse(serverArchiveUrl),
+        );
+      }
+      final needsModel = !_modelFile.existsSync();
+      final total = response.contentLength;
+      var received = 0;
+      sink = archive.openWrite();
+      await for (final chunk in response) {
+        sink.add(chunk);
+        received += chunk.length;
+        if (!needsModel && total > 0) {
+          final next = received / total;
+          if (next - (_progress ?? 0) > 0.005) {
+            _set(LlmFileStatus.downloading, progress: next);
+          }
+        }
+      }
+      await sink.close();
+      sink = null;
+      await LlamaServer.extractArchive(archive, binDirectory);
+    } finally {
+      await sink?.close().catchError((_) {});
+      if (archive.existsSync()) archive.deleteSync();
+    }
+  }
+
+  Future<void> _downloadModelFile() async {
     final part = File('${_modelFile.path}.part');
     IOSink? sink;
     try {
-      await _directory.create(recursive: true);
       // Resume a previous attempt.
       final have = part.existsSync() ? part.lengthSync() : 0;
-      _client = HttpClient();
-      final request = await _client!.getUrl(Uri.parse(url));
+      final request = await _client!.getUrl(Uri.parse(modelUrl));
       if (have > 0) {
         request.headers.set(HttpHeaders.rangeHeader, 'bytes=$have-');
       }
       final response = await request.close();
       final resumed = response.statusCode == 206;
       if (response.statusCode != 200 && !resumed) {
-        throw HttpException('HTTP ${response.statusCode}', uri: Uri.parse(url));
+        throw HttpException(
+          'HTTP ${response.statusCode}',
+          uri: Uri.parse(modelUrl),
+        );
       }
       final offset = resumed ? have : 0;
       final total = response.contentLength < 0
@@ -200,15 +276,8 @@ class LlamaTranslationModel extends TranslationModel {
         throw StateError('Download incomplete');
       }
       await part.rename(_modelFile.path);
-      _set(LlmFileStatus.ready);
-    } catch (e) {
-      if (_status != LlmFileStatus.missing) {
-        _set(LlmFileStatus.failed, error: '$e');
-      }
     } finally {
       await sink?.close().catchError((_) {});
-      _client?.close(force: true);
-      _client = null;
     }
   }
 

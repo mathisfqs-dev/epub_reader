@@ -215,7 +215,7 @@ class _Install extends StatelessWidget {
           'Install the offline $name dictionary (Wiktionary) to see the base '
           'form, grammar and definitions of a word. About '
           '${dictionaries.approximateSize(language)} is downloaded, then '
-          'prepared on this Mac in about a minute.',
+          'prepared locally in about a minute.',
           style: secondary,
         ),
         if (error != null) ...[

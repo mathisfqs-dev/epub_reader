@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' show Abi;
 import 'dart:io';
 import 'dart:math';
 
+import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 /// A llama-server process serving one GGUF model on 127.0.0.1, protected by
@@ -28,18 +30,66 @@ class LlamaServer {
   Future<int> get exitCode => _process.exitCode;
   int get pid => _process.pid;
 
-  /// Where llama-server is looked for, in order: the app bundle
-  /// (Contents/Resources/llama/), [extraDirectory], then Homebrew.
+  /// Executable name of the server (`llama-server.exe` on Windows).
+  static String get binaryName =>
+      Platform.isWindows ? 'llama-server.exe' : 'llama-server';
+
+  /// Official llama.cpp release archive downloaded when no local
+  /// `llama-server` is already installed.
+  static const releaseBuild = 'b11429';
+  static const _releaseBase =
+      'https://github.com/ggml-org/llama.cpp/releases/download/$releaseBuild';
+
+  /// Archive filename for the current OS and CPU architecture.
+  static String releaseArchiveName({Abi? abi}) {
+    return switch (abi ?? Abi.current()) {
+      Abi.macosArm64 => 'llama-$releaseBuild-bin-macos-arm64.tar.gz',
+      Abi.macosX64 => 'llama-$releaseBuild-bin-macos-x64.tar.gz',
+      Abi.linuxArm64 => 'llama-$releaseBuild-bin-ubuntu-arm64.tar.gz',
+      Abi.linuxX64 => 'llama-$releaseBuild-bin-ubuntu-x64.tar.gz',
+      Abi.windowsArm64 => 'llama-$releaseBuild-bin-win-cpu-arm64.zip',
+      Abi.windowsX64 => 'llama-$releaseBuild-bin-win-cpu-x64.zip',
+      final other => throw UnsupportedError('No llama-server build for $other'),
+    };
+  }
+
+  static String get releaseUrl => '$_releaseBase/${releaseArchiveName()}';
+
+  /// Where llama-server is looked for, in order: `$LLAMA_SERVER`, the app
+  /// bundle, system package paths (Homebrew / Linux `/usr/bin`, Windows
+  /// WinGet/Scoop), then [extraDirectory] (`Application Support/…/bin/`).
   static List<String> candidates({String? extraDirectory}) {
-    final exe = Platform.resolvedExecutable; // …/X.app/Contents/MacOS/X
-    final contents = p.dirname(p.dirname(exe));
-    return [
-      ?Platform.environment['LLAMA_SERVER'],
-      p.join(contents, 'Resources', 'llama', 'llama-server'),
-      if (extraDirectory != null) p.join(extraDirectory, 'llama-server'),
-      '/opt/homebrew/bin/llama-server',
-      '/usr/local/bin/llama-server',
-    ];
+    final exe = Platform.resolvedExecutable;
+    final bin = binaryName;
+    final list = <String>[?Platform.environment['LLAMA_SERVER']];
+    if (Platform.isMacOS) {
+      final contents = p.dirname(p.dirname(exe));
+      list.addAll([
+        p.join(contents, 'Resources', 'llama', bin),
+        '/opt/homebrew/bin/$bin',
+        '/usr/local/bin/$bin',
+      ]);
+    } else if (Platform.isLinux) {
+      list.addAll([
+        p.join(p.dirname(exe), 'llama', bin),
+        '/usr/local/bin/$bin',
+        '/usr/bin/$bin',
+        '/home/linuxbrew/.linuxbrew/bin/$bin',
+      ]);
+    } else if (Platform.isWindows) {
+      final localAppData = Platform.environment['LOCALAPPDATA'];
+      final userProfile = Platform.environment['USERPROFILE'];
+      list.addAll([
+        p.join(p.dirname(exe), 'llama', bin),
+        if (localAppData != null)
+          p.join(localAppData, 'Microsoft', 'WinGet', 'Links', bin),
+        if (userProfile != null) p.join(userProfile, 'scoop', 'shims', bin),
+      ]);
+    }
+    if (extraDirectory != null) {
+      list.add(p.join(extraDirectory, bin));
+    }
+    return list;
   }
 
   /// The first llama-server executable found, if any.
@@ -48,6 +98,76 @@ class LlamaServer {
       if (File(path).existsSync()) return path;
     }
     return null;
+  }
+
+  /// Extracts a `llama-*-bin-*.tar.gz` or `.zip` [archive] into [binDirectory]
+  /// so `binDirectory/llama-server[.exe]` and its sibling shared libraries
+  /// (`.dylib` / `.so` / `.dll`) are ready to run.
+  static Future<String> extractArchive(
+    File archive,
+    Directory binDirectory,
+  ) async {
+    final staging = Directory('${binDirectory.path}.part');
+    if (staging.existsSync()) await staging.delete(recursive: true);
+    await staging.create(recursive: true);
+    final bin = binaryName;
+    try {
+      if (archive.path.endsWith('.zip') ||
+          archive.path.endsWith('.zip.part')) {
+        final decoded = ZipDecoder().decodeBytes(await archive.readAsBytes());
+        for (final entry in decoded) {
+          final outPath = p.join(staging.path, entry.name);
+          if (entry.isFile) {
+            final outFile = File(outPath);
+            await outFile.parent.create(recursive: true);
+            await outFile.writeAsBytes(entry.content as List<int>);
+          } else {
+            await Directory(outPath).create(recursive: true);
+          }
+        }
+      } else {
+        final tar = await Process.run('tar', [
+          '-xzf',
+          archive.path,
+          '-C',
+          staging.path,
+        ]);
+        if (tar.exitCode != 0) {
+          throw ProcessException('tar', [], '${tar.stderr}');
+        }
+      }
+      // The archive may put files at the top level or inside a single
+      // `llama-bXXXX/` or `build/bin/` subfolder: find `llama-server[.exe]`
+      // and move its containing folder to [binDirectory].
+      File? found;
+      await for (final entity in staging.list(recursive: true)) {
+        if (entity is File && p.basename(entity.path) == bin) {
+          found = entity;
+          break;
+        }
+      }
+      if (found == null) {
+        throw StateError('The archive does not contain $bin');
+      }
+      if (!Platform.isWindows) {
+        await Process.run('chmod', ['+x', found.path]);
+      }
+      final sourceDir = found.parent;
+      if (binDirectory.existsSync()) {
+        await binDirectory.delete(recursive: true);
+      }
+      await binDirectory.parent.create(recursive: true);
+      if (sourceDir.path == staging.path) {
+        await staging.rename(binDirectory.path);
+      } else {
+        await sourceDir.rename(binDirectory.path);
+        await staging.delete(recursive: true);
+      }
+      return p.join(binDirectory.path, bin);
+    } catch (_) {
+      if (staging.existsSync()) await staging.delete(recursive: true);
+      rethrow;
+    }
   }
 
   /// Starts [binary] on [model] and waits until the model is loaded.
@@ -150,8 +270,17 @@ class LlamaServer {
     final pid = int.tryParse(pidFile.readAsStringSync().trim());
     pidFile.deleteSync();
     if (pid == null) return;
-    final ps = await Process.run('ps', ['-p', '$pid', '-o', 'comm=']);
-    if (!'${ps.stdout}'.contains('llama-server')) return;
+    if (Platform.isWindows) {
+      final tasklist = await Process.run('tasklist', [
+        '/FI',
+        'PID eq $pid',
+        '/NH',
+      ]);
+      if (!'${tasklist.stdout}'.toLowerCase().contains('llama-server')) return;
+    } else {
+      final ps = await Process.run('ps', ['-p', '$pid', '-o', 'comm=']);
+      if (!'${ps.stdout}'.contains('llama-server')) return;
+    }
     Process.killPid(pid);
   }
 

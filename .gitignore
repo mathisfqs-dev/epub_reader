@@ -46,3 +46,16 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# macOS CocoaPods build artifacts
+macos/Pods/
+macos/Flutter/ephemeral/
+
+# Local model weights, archives, and server binaries (never commit to git)
+*.onnx
+*.gguf
+*.tar.bz2
+*.tar.gz
+*.part
+llama-server
+
