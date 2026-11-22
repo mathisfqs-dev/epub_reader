@@ -28,6 +28,12 @@ Everything runs **100% locally on your computer**—no cloud APIs, no accounts, 
 ## Requirements
 
 - **macOS**, **Windows 10/11**, or **Linux** (64-bit x64 or ARM64; 16 GB RAM recommended when running TTS + LLM translation together)
+- **Disk space for local models** (all optional, downloaded on demand inside the app):
+  - **Gemma 3 4B translation model (`Q4_K_M.gguf`):** ~2.5 GB (+ ~30 MB if `llama-server` is auto-downloaded)
+  - **Kokoro TTS (`kokoro-multi-lang-v1_0`):** ~350 MB
+  - **Kyutai Pocket TTS:** ~185 MB per installed language (`en`, `fr`, `de`, `es` — ~740 MB if all 4 are installed)
+  - **Offline Wiktionary dictionaries:** ~210 MB for German, ~130 MB for Spanish
+  - *(Total if every model and language is installed: ~3.9 GB)*
 - **Flutter** 3.47+ / **Dart** 3.13+
 - Platform desktop toolchain:
   - **macOS:** Xcode & CocoaPods (`brew install cocoapods`)
