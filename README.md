@@ -1,5 +1,8 @@
 # EPUB Reader
 
+Context : I wanted to build an app where i could read EPUB taking them from Gutenberg project, or other sources for public domain books, and learn new languages or just be able to listen to it in languaages I know - French or English. You can lookup words with spanish and german dictionnary, and translate by selecting the text. 
+
+Technically speaking :
 An offline desktop EPUB reader (macOS, Windows, and Linux) built with Flutter, featuring sentence-synced read-aloud (**Kokoro** and **Kyutai Pocket TTS**), local context-aware literary translation (**Gemma 3 4B** via `llama-server`), and offline Wiktionary word lookups.
 
 Everything runs **100% locally on your computer**—no cloud APIs, no accounts, and no telemetry.
